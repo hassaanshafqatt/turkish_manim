@@ -1,0 +1,723 @@
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import FileResponse
+import uvicorn
+import json
+import os
+import uuid
+import shutil
+import subprocess
+import re
+import tempfile
+
+app = FastAPI()
+
+
+def parse_srt(srt_text: str):
+    """
+    Convert SRT to [(start_time, end_time, text), ...]
+    Supports:
+    - 00:00:01,500
+    - 00:00:01:500
+    """
+    entries = []
+
+    # Supports both comma and colon milliseconds
+    pattern = re.compile(
+        r"(\d+)\s+"
+        r"(\d{2}:\d{2}:\d{2}[,:]\d{1,3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,:]\d{1,3})"
+        r"\s+(.*?)(?=\n\d+\s|\Z)",
+        re.DOTALL
+    )
+
+    def time_to_seconds(t: str) -> float:
+        t = t.replace(",", ":")
+        parts = t.split(":")
+
+        # Standard format → HH:MM:SS:mmm   (3 or 4 parts)
+        if len(parts) == 3:
+            h, m, s = parts
+            ms = 0
+        elif len(parts) == 4:
+            h, m, s, ms = parts
+        else:
+            raise ValueError(f"Invalid SRT timestamp format: {t}")
+
+        return (
+            int(h) * 3600
+            + int(m) * 60
+            + float(s)
+            + (int(ms) / 1000)
+        )
+
+    for match in pattern.finditer(srt_text):
+        start = time_to_seconds(match.group(2))
+        end = time_to_seconds(match.group(3))
+        text = match.group(4).replace("\n", " ").strip()
+        entries.append((start, end, text))
+
+    return entries
+
+
+@app.post("/generate-video")
+async def generate_video(
+    question: str = Form(...),
+    options: str = Form(...),  # Dict: {"A": "..", "B": "..."}
+    correct_answer: str = Form(...),
+    explanation: str = Form(...),
+    image: UploadFile = File(None),
+    audio: UploadFile = File(None),
+    subtitles: UploadFile = File(None),  # now SRT file
+    font_name: str = Form("Pangolin")  # Font name (default: Pangolin)
+):
+    """
+    Accepts form-data containing quiz info, image/audio files,
+    and SRT subtitles file.
+    """
+
+    tmp_root = tempfile.gettempdir()
+    render_id = str(uuid.uuid4())
+    work_dir = os.path.join(tmp_root, render_id)
+    os.makedirs(work_dir, exist_ok=True)
+
+    # Save image
+    image_path = None
+    if image:
+        image_filename = image.filename
+        image_path_full = os.path.join(work_dir, image_filename)
+        with open(image_path_full, "wb") as f:
+            shutil.copyfileobj(image.file, f)
+        # Store just filename since we run from work_dir
+        image_path = image_filename
+
+    # Save audio
+    audio_path = None
+    if audio:
+        audio_filename = audio.filename
+        audio_path_full = os.path.join(work_dir, audio_filename)
+        with open(audio_path_full, "wb") as f:
+            shutil.copyfileobj(audio.file, f)
+        # Store just filename since we run from work_dir
+        audio_path = audio_filename
+
+    # Parse options -> convert {"A": "London"} to "A) London"
+    options_json = json.loads(options)
+    formatted_options = [f"{key}) {value}" for key, value in options_json.items()]
+
+    # Parse SRT file
+    subtitle_entries = []
+    if subtitles:
+        srt_text = (await subtitles.read()).decode("utf-8")
+        subtitle_entries = parse_srt(srt_text)
+
+    # Build quiz data JSON
+    quiz_data = {
+        "question": question,
+        "options": formatted_options,
+        "correct_answer": correct_answer,
+        "explanation": explanation,
+        "subtitles": subtitle_entries,
+        "image_path": image_path,
+        "voice_path": audio_path,
+        "font_name": font_name,  # Include font name in quiz data
+    }
+
+    # Save quiz.json
+    json_path = f"{work_dir}/quiz.json"
+    with open(json_path, "w") as f:
+        json.dump(quiz_data, f, indent=4)
+
+    # Copy font file to work directory if it exists
+    font_source = "QMR.ttf"
+    if os.path.exists(font_source):
+        font_dest = os.path.join(work_dir, "QMR.ttf")
+        shutil.copy2(font_source, font_dest)
+    
+    # Write Manim scene
+    manim_script_path = f"{work_dir}/quiz_scene.py"
+    with open(manim_script_path, "w", encoding="utf-8") as f:
+        f.write(MANIM_SCRIPT)
+
+    # Render with Manim
+    output_path = os.path.join(work_dir, "media", "QuizAnimation.mp4")
+
+
+    try:
+        subprocess.run(
+    [
+        "manim",
+        "-qk",
+        manim_script_path,
+        "QuizAnimation",
+        "--custom_folders",
+        "--media_dir",
+        f"{work_dir}/media"
+    ],
+    check=True,
+    cwd=work_dir                   # <── FIX
+)
+
+    except Exception as e:
+        return {"error": str(e)}
+
+    return FileResponse(
+        output_path,
+        media_type="video/mp4",
+        filename="quiz_video.mp4"
+    )
+
+
+# --------------------- MANIM SCRIPT (UNCHANGED) ---------------------
+MANIM_SCRIPT = r'''
+from manim import *
+from manim_fonts import *
+import json
+import os
+import textwrap
+
+# -------------------- VERTICAL 9:16 CONFIG --------------------
+config.pixel_height = 1920
+config.pixel_width = 1080
+config.frame_height = 16  # Manim units
+config.frame_width = 9
+
+# -------------------- FONT CONFIGURATION --------------------
+# Font name will be read from quiz_data, default to "Pangolin"
+
+def wrap_text(text: str, max_chars: int):
+    # Preserve existing newlines, wrap each paragraph separately
+    paragraphs = text.split("\n")
+    wrapped = [textwrap.fill(p, width=max_chars) for p in paragraphs]
+    return "\n".join(wrapped)
+
+class QuizAnimation(Scene):
+    def construct(self):
+        if not os.path.exists("quiz.json"):
+            raise Exception("quiz.json not found")
+
+        with open("quiz.json", "r") as f:
+            quiz_data = json.load(f)
+        
+        # Get font name from quiz data, default to "Pangolin"
+        font_name = quiz_data.get("font_name", "Pangolin")
+        
+        # Register font - try Google Fonts first, then local file, then fallback
+        self.font_family = "Arial"  # Default fallback
+        
+        # Try to register from Google Fonts
+        try:
+            with RegisterFont(font_name) as fonts:
+                self.font_family = fonts[0]
+                # Run entire scene within font context
+                self.show_question_phase(quiz_data)
+                self.show_answer_phase(quiz_data)
+        except:
+            # If Google Fonts fails, try local file path (check if font_name matches a local file)
+            local_font_file = f"{font_name}.ttf"
+            if os.path.exists(local_font_file):
+                try:
+                    font_path = os.path.abspath(local_font_file)
+                    # Try using the file path directly
+                    self.font_family = font_path
+                    self.show_question_phase(quiz_data)
+                    self.show_answer_phase(quiz_data)
+                except:
+                    # Use fallback
+                    self.show_question_phase(quiz_data)
+                    self.show_answer_phase(quiz_data)
+            else:
+                # Use fallback
+                self.show_question_phase(quiz_data)
+                self.show_answer_phase(quiz_data)
+
+    def show_question_phase(self, data):
+        # IMAGE - full screen background
+        if data.get("image_path"):
+            try:
+                img = ImageMobject(data["image_path"])
+                # Scale to cover full height while maintaining aspect ratio
+                img.set_height(config.frame_height)
+                # If image is wider than frame, scale down to fit width
+                if img.width > config.frame_width:
+                    scale_factor = config.frame_width / img.width
+                    img.scale(scale_factor)
+                img.move_to(ORIGIN)
+                # Add image first so it's in the background
+                self.add(img)
+            except Exception as e:
+                # If image fails, log but continue
+                print(f"Image loading error: {e}")
+                pass
+
+        # QUESTION - Material Design card with Turkish title
+        # 40px margin = 40/1080 * 9 = ~0.33 Manim units
+        margin_units = 0.4  # 40px equivalent
+        text_padding = 0.3  # Padding inside box
+        
+        # Create box first (centered with margins)
+        # Use font constant
+        question_title = Text("Soru", font_size=40, color="#212121", weight=BOLD, font=self.font_family)
+        
+        # Calculate box width first
+        box_width = config.frame_width - 2 * margin_units
+        # Text width should be box width minus padding on both sides
+        text_max_width = box_width - 2 * text_padding
+        
+        q_wrapped = wrap_text(data["question"], 30)
+        question_text = Paragraph(
+            q_wrapped,
+            font_size=40,
+            line_spacing=0.8,
+            alignment="left",
+            color="#212121",  # Material Design dark gray
+            font=self.font_family
+        )
+        # Constrain text to box boundaries (not frame boundaries)
+        question_text.set_max_width(text_max_width)
+        question_text.next_to(question_title, DOWN, buff=0.25)
+
+        # Combine title and text in VGroup
+        question_group = VGroup(question_title, question_text)
+        
+        # Minimal white box for question (smaller, with 40px margins, centered)
+        question_box = RoundedRectangle(
+            width=box_width,
+            height=question_group.height + 0.5,
+            corner_radius=0.15,
+            fill_color=WHITE,
+            fill_opacity=0.95,
+            stroke_width=0
+        )
+        # Center box horizontally, position near top
+        box_y = config.frame_height / 2 - 0.6 - question_box.height / 2
+        question_box.move_to([0, box_y, 0])
+        
+        # Position text group inside box, left-aligned with padding
+        # Position relative to box left edge + padding
+        question_group.move_to([
+            question_box.get_left()[0] + text_padding + question_group.width / 2,
+            question_box.get_center()[1],
+            0
+        ])
+        
+        # Subtle shadow effect
+        question_shadow = RoundedRectangle(
+            width=question_box.width,
+            height=question_box.height,
+            corner_radius=0.15,
+            fill_color=BLACK,
+            fill_opacity=0.1,
+            stroke_width=0
+        )
+        question_shadow.move_to(question_box.get_center() + 0.05 * DOWN + 0.05 * RIGHT)
+
+        # Animate question box sliding in from left
+        question_box_start = question_box.copy()
+        question_shadow_start = question_shadow.copy()
+        question_group_start = question_group.copy()
+        
+        # Position off-screen to the left
+        slide_distance = config.frame_width + question_box.width
+        question_box_start.shift(LEFT * slide_distance)
+        question_shadow_start.shift(LEFT * slide_distance)
+        question_group_start.shift(LEFT * slide_distance)
+        
+        # Add in starting position
+        self.add(question_shadow_start, question_box_start, question_group_start)
+        
+        # Animate sliding in
+        self.play(
+            question_shadow_start.animate.move_to(question_shadow.get_center()),
+            question_box_start.animate.move_to(question_box.get_center()),
+            question_group_start.animate.move_to(question_group.get_center()),
+            run_time=0.6
+        )
+        
+        # Replace with final positions
+        self.remove(question_shadow_start, question_box_start, question_group_start)
+        self.add(question_shadow, question_box, question_group)
+        
+        # Store question elements for later animation
+        self.question_box = question_box
+        self.question_shadow = question_shadow
+        self.question_group = question_group
+
+        # OPTIONS - Material Design cards with labels
+        options_group = VGroup()
+        option_boxes = VGroup()
+        option_shadows = VGroup()
+        option_labels = VGroup()
+        
+        # Store option elements for later highlighting
+        self.option_elements = []
+        
+        for option in data["options"]:
+            # Parse option: "A) London" -> label="A", value="London"
+            if ") " in option:
+                label, value = option.split(") ", 1)
+            else:
+                label = option[0] if option else "?"
+                value = option[2:] if len(option) > 2 else option
+            
+            # Label on the left (A, B, C, D)
+            label_text = Text(label, font_size=40, color="#212121", weight=BOLD, font=self.font_family)
+            
+            # Option value text
+            value_wrapped = wrap_text(value, 20)
+            value_text = Paragraph(
+                value_wrapped,
+                font_size=34,
+                line_spacing=0.85,
+                alignment="left",
+                color="#212121",
+                font=self.font_family
+            )
+            value_text.set_max_width(config.frame_width - 4.0)
+            
+            # Combine label and value horizontally
+            option_row = VGroup(label_text, value_text)
+            option_row.arrange(RIGHT, buff=0.3, aligned_edge=UP)
+            options_group.add(option_row)
+            
+            # Minimal white box for each option
+            opt_box = RoundedRectangle(
+                width=option_row.width + 0.6,
+                height=max(label_text.height, value_text.height) + 0.4,
+                corner_radius=0.12,
+                fill_color=WHITE,
+                fill_opacity=0.95,
+                stroke_width=0
+            )
+            opt_box.move_to(option_row.get_center())
+            option_boxes.add(opt_box)
+            
+            # Subtle shadow
+            opt_shadow = RoundedRectangle(
+                width=option_row.width + 0.6,
+                height=max(label_text.height, value_text.height) + 0.4,
+                corner_radius=0.12,
+                fill_color=BLACK,
+                fill_opacity=0.1,
+                stroke_width=0
+            )
+            opt_shadow.move_to(opt_box.get_center() + 0.04 * DOWN + 0.04 * RIGHT)
+            option_shadows.add(opt_shadow)
+            option_labels.add(label_text)
+            
+            # Store for later highlighting
+            self.option_elements.append({
+                "label": label_text,
+                "value": value_text,
+                "value_text": value,  # Store original text
+                "row": option_row,
+                "box": opt_box,
+                "shadow": opt_shadow,
+                "label_str": label.strip()
+            })
+
+        # Arrange options in 2x2 grid layout (A B on first row, C D on second row, E below if needed)
+        # Group options into rows
+        num_options = len(options_group)
+        first_row = VGroup()
+        second_row = VGroup()
+        extra_options = VGroup()
+        
+        for i, opt_row in enumerate(options_group):
+            if i < 2:
+                first_row.add(opt_row)
+            elif i < 4:
+                second_row.add(opt_row)
+            else:
+                extra_options.add(opt_row)
+        
+        # Arrange rows horizontally
+        if first_row:
+            first_row.arrange(RIGHT, buff=1.0)
+        if second_row:
+            second_row.arrange(RIGHT, buff=1.0)
+        if extra_options:
+            extra_options.arrange(RIGHT, buff=1.0)
+        
+        # Position rows vertically - right underneath question box with gap
+        # Question box is at top, options should be below it
+        question_bottom = self.question_box.get_bottom()[1]
+        gap = 0.6  # Gap between question and options
+        
+        if first_row and second_row:
+            first_row_y = question_bottom - gap - first_row.height / 2
+            second_row_y = first_row_y - 1.5
+            first_row.move_to([0, first_row_y, 0])
+            second_row.move_to([0, second_row_y, 0])
+            if extra_options:
+                extra_options.move_to([0, second_row_y - 1.5, 0])
+        elif first_row:
+            first_row_y = question_bottom - gap - first_row.height / 2
+            first_row.move_to([0, first_row_y, 0])
+            if extra_options:
+                extra_options.move_to([0, first_row_y - 1.5, 0])
+        else:
+            if extra_options:
+                extra_options_y = question_bottom - gap - extra_options.height / 2
+                extra_options.move_to([0, extra_options_y, 0])
+        
+        # Rebuild options_group with new arrangement
+        options_group = VGroup()
+        if first_row:
+            options_group.add(*first_row)
+        if second_row:
+            options_group.add(*second_row)
+        if extra_options:
+            options_group.add(*extra_options)
+        
+        # Position boxes and shadows to match text
+        for i, opt_row in enumerate(options_group):
+            # Find corresponding box and shadow
+            opt_elem = self.option_elements[i]
+            opt_box = opt_elem["box"]
+            opt_shadow = opt_elem["shadow"]
+            
+            opt_box.move_to(opt_row.get_center())
+            opt_shadow.move_to(opt_box.get_center() + 0.04 * DOWN + 0.04 * RIGHT)
+        
+        # Create VGroups for final positions
+        option_shadows = VGroup(*[elem["shadow"] for elem in self.option_elements])
+        option_boxes = VGroup(*[elem["box"] for elem in self.option_elements])
+        
+        # Animate options sliding in from left (after question)
+        # First: stack them completely overlapping off-screen
+        stacked_y = question_bottom - gap - 1.0
+        stacked_x = -config.frame_width / 2 - 2.0
+        stacked_pos = [stacked_x, stacked_y, 0]
+        
+        option_shadows_start = VGroup()
+        option_boxes_start = VGroup()
+        options_group_start = VGroup()
+        
+        for i, elem in enumerate(self.option_elements):
+            shadow_start = elem["shadow"].copy()
+            box_start = elem["box"].copy()
+            row_start = elem["row"].copy()
+            
+            # Stack them completely overlapping (same position for all)
+            shadow_start.move_to(stacked_pos)
+            box_start.move_to(stacked_pos)
+            row_start.move_to(stacked_pos)
+            
+            option_shadows_start.add(shadow_start)
+            option_boxes_start.add(box_start)
+            options_group_start.add(row_start)
+        
+        # Add in starting position (stacked and overlapping)
+        self.add(option_shadows_start, option_boxes_start, options_group_start)
+        
+        # Animate: slide in while stacked (slower)
+        slide_in_distance = config.frame_width / 2 + 1.0
+        self.play(
+            option_shadows_start.animate.shift(RIGHT * slide_in_distance),
+            option_boxes_start.animate.shift(RIGHT * slide_in_distance),
+            options_group_start.animate.shift(RIGHT * slide_in_distance),
+            run_time=0.8  # Slower animation
+        )
+        
+        # Now shuffle to their designated grid positions (slower)
+        shuffle_anims = []
+        for i, elem in enumerate(self.option_elements):
+            target_row = options_group[i] if i < len(options_group) else None
+            if target_row:
+                target_pos = target_row.get_center()
+                shuffle_anims.extend([
+                    option_shadows_start[i].animate.move_to(option_shadows[i].get_center()),
+                    option_boxes_start[i].animate.move_to(option_boxes[i].get_center()),
+                    options_group_start[i].animate.move_to(target_pos),
+                ])
+        
+        self.play(*shuffle_anims, run_time=0.8)  # Slower shuffle animation
+        
+        # Replace with final positions
+        self.remove(option_shadows_start, option_boxes_start, options_group_start)
+        self.add(option_shadows, option_boxes, options_group)
+
+        self.wait(5)
+
+    def show_answer_phase(self, data):
+        correct_answer = data.get("correct_answer", "").strip()
+        correct_option = None
+        incorrect_options = []
+        
+        # Find correct and incorrect options
+        if hasattr(self, 'option_elements'):
+            for opt_elem in self.option_elements:
+                if opt_elem["label_str"] == correct_answer:
+                    correct_option = opt_elem
+                else:
+                    incorrect_options.append(opt_elem)
+        
+        # Step 1: Question box stays in place (no animation)
+        
+        # Step 2: Fade out incorrect options
+        fade_anims = []
+        for opt_elem in incorrect_options:
+            fade_anims.extend([
+                FadeOut(opt_elem["row"]),
+                FadeOut(opt_elem["box"]),
+                FadeOut(opt_elem["shadow"])
+            ])
+        
+        if fade_anims:
+            self.play(*fade_anims, run_time=0.5)
+            for opt_elem in incorrect_options:
+                self.remove(opt_elem["row"], opt_elem["box"], opt_elem["shadow"])
+        
+        # Step 3: Move correct option to first row position (same x-axis)
+        if correct_option:
+            # Get first row y position from the first option (which is always in first row)
+            first_row_y = None
+            if hasattr(self, 'option_elements') and len(self.option_elements) > 0:
+                first_option = self.option_elements[0]
+                # Get the current position of first option's row
+                first_row_y = first_option["row"].get_center()[1]
+            
+            if first_row_y is None:
+                # Fallback: calculate from question box
+                question_bottom = self.question_box.get_bottom()[1]
+                gap = 0.6
+                first_row_y = question_bottom - gap - 0.5
+            
+            # Keep original x position, move to first row y
+            current_x = correct_option["row"].get_center()[0]
+            target_pos = [current_x, first_row_y, 0]
+            
+            # Create green outline box (keep white fill, add green stroke with thicker outline)
+            green_outline_box = RoundedRectangle(
+                width=correct_option["box"].width,
+                height=correct_option["box"].height,
+                corner_radius=0.12,
+                fill_color=WHITE,
+                fill_opacity=0.95,
+                stroke_color=GREEN,
+                stroke_width=6,  # Thicker outline
+                stroke_opacity=1.0
+            )
+            green_outline_box.move_to(target_pos)
+            
+            # Enhanced shadow for moved option
+            enhanced_shadow = RoundedRectangle(
+                width=correct_option["shadow"].width,
+                height=correct_option["shadow"].height,
+                corner_radius=0.12,
+                fill_color=BLACK,
+                fill_opacity=0.15,
+                stroke_width=0
+            )
+            enhanced_shadow.move_to(green_outline_box.get_center() + 0.04 * DOWN + 0.04 * RIGHT)
+            
+            # Animate: move to center position and add green outline
+            self.play(
+                correct_option["row"].animate.move_to(target_pos),
+                correct_option["box"].animate.move_to(target_pos),
+                correct_option["shadow"].animate.move_to(enhanced_shadow.get_center()),
+                Transform(correct_option["box"], green_outline_box),
+                run_time=0.7
+            )
+            
+            # Update stored position
+            correct_option["row"].move_to(target_pos)
+            correct_option["box"] = green_outline_box
+            correct_option["shadow"] = enhanced_shadow
+        
+        # Step 5: Add explanation text below correct option (no box, just white text)
+        # Calculate text width (50px margin on each side)
+        # 50px = 50/1080 * 9 ≈ 0.42 Manim units
+        margin_50px = 0.42
+        exp_text_max_width = config.frame_width - 2 * margin_50px
+        
+        # Position explanation text below correct option
+        if correct_option:
+            explanation_y = correct_option["row"].get_bottom()[1] - 0.6  # Gap below option
+        else:
+            explanation_y = 2.0
+        
+        # Create explanation text area (will use typewriter effect)
+        # Use font constant
+        explanation_area = Text("", font_size=32, color="#212121", font=self.font_family)
+        explanation_area.set_max_width(exp_text_max_width)
+        explanation_area.move_to([0, explanation_y, 0])
+        explanation_area.to_edge(LEFT, buff=margin_50px)
+        
+        self.add(explanation_area)
+
+        # Voice / audio
+        if data.get("voice_path"):
+            try:
+                self.add_sound(data["voice_path"])
+            except:
+                pass
+
+        # Subtitles - simple approach: each subtitle continues after previous, respects width
+        subtitles = data.get("subtitles", [])
+        if subtitles:
+            # Track the last text element for positioning
+            last_text = None
+            
+            for i, (start, end, text) in enumerate(subtitles):
+                duration = max(0.1, end - start)
+                
+                # Create text for this subtitle
+                new_line = Text(
+                    text,
+                    font_size=32,
+                    color="#212121",
+                    font=self.font_family
+                )
+                new_line.set_max_width(exp_text_max_width)
+                
+                # Position: first line below option, subsequent lines continue from previous
+                if i == 0:
+                    # First subtitle - position below correct option, left-aligned
+                    if correct_option:
+                        new_line.next_to(correct_option["row"], DOWN, buff=0.6)
+                    else:
+                        new_line.move_to([0, explanation_y, 0])
+                    new_line.to_edge(LEFT, buff=margin_50px)
+                else:
+                    # Continue from previous text - try to position to the right first
+                    new_line.next_to(last_text, RIGHT, buff=0.1, aligned_edge=UP)
+                    
+                    # Check if it would overflow the width (respecting margins)
+                    # Frame right edge is at config.frame_width / 2, minus margin
+                    right_edge = new_line.get_right()[0]
+                    max_right = config.frame_width / 2 - margin_50px
+                    
+                    if right_edge > max_right:
+                        # Would overflow - position below instead, left-aligned with gap
+                        new_line.next_to(last_text, DOWN, buff=0.2, aligned_edge=LEFT)
+                        # Ensure it respects left margin - always left-align
+                        new_line.to_edge(LEFT, buff=margin_50px)
+                    else:
+                        # If it fits on same line, ensure it's still left-aligned if needed
+                        # (it should be fine since it continues from previous)
+                        pass
+                
+                # Write with typewriter effect
+                self.play(
+                    Write(new_line, run_time=duration),
+                )
+                
+                # Store this line for next positioning
+                last_text = new_line
+                
+                # Remove the empty placeholder if this is the first line
+                if i == 0:
+                    self.remove(explanation_area)
+
+        self.wait(2)
+
+    def get_answer_text(self, data):
+        for op in data["options"]:
+            if op.startswith(data["correct_answer"] + ")"):
+                return op.split(") ", 1)[1]
+        return ""
+'''
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8001)
